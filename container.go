@@ -4,6 +4,10 @@ import "fmt"
 import "reflect"
 import "sync"
 
+// Registry is global registry of types being resolved by container.
+// Because golang lacks global type registry, you should manually
+// register types by `RegisterType`, `RegisterValue` or `RegisterFactory`
+// methods.
 var Registry Container = &container{
 	nil,
 	make([]*factory, 0),
