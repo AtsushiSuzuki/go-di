@@ -8,12 +8,7 @@ import "sync"
 // Because golang lacks global type registry, you should manually
 // register types by `RegisterType`, `RegisterValue` or `RegisterFactory`
 // methods.
-var Registry Container = &container{
-	nil,
-	make([]*alias, 0),
-	make([]*factory, 0),
-	sync.RWMutex{},
-}
+var Registry Container = newContainer(nil)
 
 type Container interface {
 	NewScope() Container
@@ -43,10 +38,12 @@ type Constructor func(c Container) (interface{}, error)
 type Destructor func(i interface{}) error
 
 type container struct {
-	parent    *container
-	aliases   []*alias
-	factories []*factory
-	lock      sync.RWMutex
+	parent      *container
+	aliases     []*alias
+	factories   []*factory
+	cache       map[*factory]interface{}
+	destructors []func() error
+	lock        sync.RWMutex
 }
 
 type alias struct {
@@ -61,13 +58,19 @@ type factory struct {
 	Destructor  Destructor
 }
 
-func (this *container) NewScope() Container {
+func newContainer(parent *container) *container {
 	return &container{
-		this,
+		parent,
 		make([]*alias, 0),
 		make([]*factory, 0),
+		make(map[*factory]interface{}),
+		make([]func() error, 0),
 		sync.RWMutex{},
 	}
+}
+
+func (this *container) NewScope() Container {
+	return newContainer(this)
 }
 
 func (this *container) RegisterType(v interface{}, lifetime Lifetime) {
@@ -235,7 +238,6 @@ func (this *container) ResolveAll(tag string) ([]interface{}, error) {
 	}()
 
 	var instances []interface{}
-	var err error
 	for _, factory := range factories {
 		i, err := factory.Constructor(this)
 		if err != nil {
@@ -248,14 +250,14 @@ func (this *container) ResolveAll(tag string) ([]interface{}, error) {
 }
 
 func (this *container) Inject(v interface{}) error {
-	v := reflect.ValueOf(i)
-	if v.Type().Kind() == reflect.Ptr {
-		v = reflect.Indirect(v)
+	val := reflect.ValueOf(v)
+	if val.Type().Kind() == reflect.Ptr {
+		val = reflect.Indirect(val)
 	}
-	if v.Type().Kind() != reflect.Struct {
+	if val.Type().Kind() != reflect.Struct {
 		panic("struct or pointer to struct required")
 	}
-	t := v.Type()
+	t := val.Type()
 
 	for i := 0; i < t.NumField(); i++ {
 		f := t.Field(i)
@@ -264,7 +266,7 @@ func (this *container) Inject(v interface{}) error {
 			if err != nil {
 				return err
 			}
-			v.Field(i).Set(reflect.ValueOf(fi))
+			val.Field(i).Set(reflect.ValueOf(fi))
 		}
 	}
 
