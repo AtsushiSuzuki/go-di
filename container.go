@@ -410,11 +410,11 @@ func (this *container) Inject(v interface{}) error {
 }
 
 func (this *container) Close() error {
-	this.lock.RLock()
+	this.lock.Lock()
 	dtors := make([]func() error, len(this.destructors))
 	copy(dtors, this.destructors)
 	this.destructors = this.destructors[:0]
-	this.lock.RUnlock()
+	this.lock.Unlock()
 
 	for i := len(dtors) - 1; 0 <= i; i-- {
 		err := dtors[i]()
