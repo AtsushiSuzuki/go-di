@@ -1,42 +1,115 @@
+// Package `di` implements basic dependency injection (DI) container.
 package di
 
 import "fmt"
 import "reflect"
 import "sync"
 
-// Registry is global registry of types being resolved by container.
-// Because golang lacks global type registry, you should manually
-// register types by `RegisterType`, `RegisterValue` or `RegisterFactory`
-// methods.
-var Registry Container = newContainer(nil)
-
-type Container interface {
-	NewScope() Container
-	RegisterType(v interface{}, lifetime Lifetime)
-	RegisterValue(v interface{})
-	// TODO: assume type from constructor by reflection
-	RegisterFactory(v interface{}, ctor Constructor, dtor Destructor, lifetime Lifetime)
-	Use(tag string, tagOrTypeName string)
-	UseType(tag string, v interface{}, lifetime Lifetime)
-	UseValue(tag string, v interface{})
-	UseFactory(tag string, ctor Constructor, dtor Destructor, lifetime Lifetime)
-	Resolve(tag string) (interface{}, error)
-	ResolveAll(tag string) ([]interface{}, error)
-	Inject(v interface{}) error
-	Close() error
-}
-
+// `Lifetime` represents lifetime of instance resolved by container.
 type Lifetime int
 
 const (
+	// `Transient` lifetime specifies that instances should
+	// be created each time container resolves dependency.
 	Transient Lifetime = iota
+
+	// `Scoped` lifetime specifies that the instance should be reused
+	// by the same container.
 	Scoped
+
+	// `Singleton` lifetime specifies that the instance should be
+	// reused for process lifetime.
 	Singleton
 )
 
+// `Constructor` is generic function type to create instance.
+//
+// `Container` does not support constructor injection.
+// Instead, you can use supplied `Container` to
+// wire up your instance's dependency.
 type Constructor func(c Container) (interface{}, error)
 
+// `Destructor` is cleanup function for created instance.
 type Destructor func(i interface{}) error
+
+// `Container` is type registry and dependency resolver.
+//
+// You can use `RegisterType`, `RegisterValue` or `RegisterFactory` to
+// register types to the container, and then use `Resolve` to obtain
+// an registered instance.
+//
+// `Container` instance is obtained by `Registry.NewScope()`.
+type Container interface {
+	// `NewScope` creates new scoped container from parent container.
+	//
+	// Created scope inherits type registrations from it's parent.
+	NewScope() Container
+
+	// `RegisterType` registers type (`reflect.TypeOf(v)`) for
+	// it's type name (`reflect.TypeOf(v).String`).
+	//
+	// When resolved, new zero/nil instance is created.
+	// If type is pointer, type is resolved as an pointer points to
+	// newly created element instead of nil pointer.
+	//
+	// If created instance is struct, it's field with
+	// tag `di:"<tag>"` will be injected. see `Inject`.
+	RegisterType(v interface{}, lifetime Lifetime)
+
+	// `RegisterValue` registers supplied value `v` for
+	// it's type name.
+	RegisterValue(v interface{})
+
+	// `RegisterFactory` registers factory method for type name of `v`.
+	//
+	// You can optionally use destructor. If supplied, `dtor` is called
+	// for each resolved instance when asociated container is `Close`ed.
+	//
+	// TODO: inspect type name from constructor return value
+	RegisterFactory(v interface{}, ctor Constructor, dtor Destructor, lifetime Lifetime)
+
+	// `Use` sets an alias for other tag or type name.
+	Use(tag string, tagOrTypeName string)
+
+	// `UseType` registers type for specified tag.
+	//
+	// See `RegisterType`.
+	UseType(tag string, v interface{}, lifetime Lifetime)
+
+	// `UseValue` registers value for specified tag.
+	//
+	// See `RegisterValue`
+	UseValue(tag string, v interface{})
+
+	// `UseFactory` registers factory method for specified tag.
+	//
+	// See `RegisterFactory`.
+	UseFactory(tag string, ctor Constructor, dtor Destructor, lifetime Lifetime)
+
+	// `Resolve` returns instance for specified tag.
+	//
+	// If multiple type is registered for tag,
+	// `Resolve` returns instance of last registered type.
+	//
+	// If no type is registered for tag, returns `ErrNoMatchingTag`.
+	Resolve(tag string) (interface{}, error)
+
+	// `ResolveAll` returns slice of instances for specified tag.
+	ResolveAll(tag string) ([]interface{}, error)
+
+	// `Inject` fills struct `v`'s fields with resolved instances
+	// if field with tagged as `di:"<tag>"`
+	Inject(v interface{}) error
+
+	// `Close` invokes destructors for all instances resolved by
+	// the container.
+	Close() error
+}
+
+// `Registry` is global registry of types being resolved by containers.
+var Registry Container = newContainer(nil)
+
+var ErrNoMatchingTag error = fmt.Errorf("no matching tag found")
 
 type container struct {
 	parent      *container
@@ -279,7 +352,7 @@ func (this *container) Resolve(tag string) (interface{}, error) {
 	if found {
 		return this.createInstance(factory)
 	} else {
-		return nil, fmt.Errorf("no matching tag found.")
+		return nil, ErrNoMatchingTag
 	}
 }
 
@@ -338,7 +411,9 @@ func (this *container) Inject(v interface{}) error {
 
 func (this *container) Close() error {
 	this.lock.RLock()
-	dtors := this.destructors
+	dtors := make([]func() error, len(this.destructors))
+	copy(dtors, this.destructors)
+	this.destructors = this.destructors[:0]
 	this.lock.RUnlock()
 
 	for i := len(dtors) - 1; 0 <= i; i-- {
