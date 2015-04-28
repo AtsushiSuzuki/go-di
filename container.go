@@ -13,11 +13,12 @@ var Registry Container = newContainer(nil)
 type Container interface {
 	NewScope() Container
 	RegisterType(v interface{}, lifetime Lifetime)
-	RegisterValue(v interface{}, lifetime Lifetime)
+	RegisterValue(v interface{})
+	// TODO: assume type from constructor by reflection
 	RegisterFactory(v interface{}, ctor Constructor, dtor Destructor, lifetime Lifetime)
 	Use(tag string, tagOrTypeName string)
 	UseType(tag string, v interface{}, lifetime Lifetime)
-	UseValue(tag string, v interface{}, lifetime Lifetime)
+	UseValue(tag string, v interface{})
 	UseFactory(tag string, ctor Constructor, dtor Destructor, lifetime Lifetime)
 	Resolve(tag string) (interface{}, error)
 	ResolveAll(tag string) ([]interface{}, error)
@@ -78,9 +79,9 @@ func (this *container) RegisterType(v interface{}, lifetime Lifetime) {
 	this.UseType(t.String(), v, lifetime)
 }
 
-func (this *container) RegisterValue(v interface{}, lifetime Lifetime) {
+func (this *container) RegisterValue(v interface{}) {
 	t := reflect.TypeOf(v)
-	this.UseValue(t.String(), v, lifetime)
+	this.UseValue(t.String(), v)
 }
 
 func (this *container) RegisterFactory(v interface{}, ctor Constructor, dtor Destructor, lifetime Lifetime) {
@@ -119,13 +120,13 @@ func (this *container) UseType(tag string, v interface{}, lifetime Lifetime) {
 	})
 }
 
-func (this *container) UseValue(tag string, v interface{}, lifetime Lifetime) {
+func (this *container) UseValue(tag string, v interface{}) {
 	this.lock.Lock()
 	defer this.lock.Unlock()
 
 	this.factories = append(this.factories, &factory{
 		Tag:      tag,
-		Lifetime: lifetime,
+		Lifetime: Transient,
 		Constructor: func(c Container) (interface{}, error) {
 			return v, nil
 		},
@@ -204,16 +205,57 @@ func (this *container) createInstance(f *factory) (interface{}, error) {
 
 	switch f.Lifetime {
 	case Scoped:
-		if cached, ok := c.cache[f]; ok {
+		this.lock.RLock()
+		cached, ok := this.cache[f]
+		this.lock.RUnlock()
+		if ok {
 			return cached, nil
 		}
 	case Singleton:
-		if cached, ok := root.cache[f]; ok {
+		root.lock.RLock()
+		cached, ok := root.cache[f]
+		root.lock.RUnlock()
+		if ok {
 			return cached, nil
 		}
 	}
 
-	// TODO: 途中
+	instance, err := f.Constructor(this)
+	if err != nil {
+		return instance, err
+	}
+
+	switch f.Lifetime {
+	case Scoped:
+		this.lock.Lock()
+		this.cache[f] = instance
+		this.lock.Unlock()
+	case Singleton:
+		root.lock.Lock()
+		root.cache[f] = instance
+		root.lock.Unlock()
+	}
+
+	if f.Destructor != nil {
+		switch f.Lifetime {
+		case Transient:
+			fallthrough
+		case Scoped:
+			this.lock.Lock()
+			this.destructors = append(this.destructors, func() error {
+				return f.Destructor(instance)
+			})
+			this.lock.Unlock()
+		case Singleton:
+			root.lock.Lock()
+			root.destructors = append(root.destructors, func() error {
+				return f.Destructor(instance)
+			})
+			root.lock.Unlock()
+		}
+	}
+
+	return instance, nil
 }
 
 func (this *container) Resolve(tag string) (interface{}, error) {
@@ -235,7 +277,7 @@ func (this *container) Resolve(tag string) (interface{}, error) {
 	}()
 
 	if found {
-		return factory.Constructor(this)
+		return this.createInstance(factory)
 	} else {
 		return nil, fmt.Errorf("no matching tag found.")
 	}
@@ -259,12 +301,12 @@ func (this *container) ResolveAll(tag string) ([]interface{}, error) {
 	}()
 
 	var instances []interface{}
-	for _, factory := range factories {
-		i, err := factory.Constructor(this)
+	for i := len(factories) - 1; 0 <= i; i-- {
+		v, err := this.createInstance(factories[i])
 		if err != nil {
 			return nil, err
 		}
-		instances = append(instances, i)
+		instances = append(instances, v)
 	}
 
 	return instances, nil
@@ -295,5 +337,16 @@ func (this *container) Inject(v interface{}) error {
 }
 
 func (this *container) Close() error {
-	panic("not implemented")
+	this.lock.RLock()
+	dtors := this.destructors
+	this.lock.RUnlock()
+
+	for i := len(dtors) - 1; 0 <= i; i-- {
+		err := dtors[i]()
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
