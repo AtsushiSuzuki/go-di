@@ -195,6 +195,27 @@ func (this *container) resolveAliases(tag string) tags {
 	return tags
 }
 
+func (this *container) createInstance(f *factory) (interface{}, error) {
+	root := func(c *container) *container {
+		for ; c.parent != nil; c = c.parent {
+		}
+		return c
+	}(this)
+
+	switch f.Lifetime {
+	case Scoped:
+		if cached, ok := c.cache[f]; ok {
+			return cached, nil
+		}
+	case Singleton:
+		if cached, ok := root.cache[f]; ok {
+			return cached, nil
+		}
+	}
+
+	// TODO: 途中
+}
+
 func (this *container) Resolve(tag string) (interface{}, error) {
 	factory, found := func() (*factory, bool) {
 		this.lock.RLock()
