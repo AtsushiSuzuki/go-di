@@ -10,23 +10,33 @@ import "sync"
 // methods.
 var Registry Container = &container{
 	nil,
+	make([]*alias, 0),
 	make([]*factory, 0),
 	sync.RWMutex{},
 }
 
 type Container interface {
 	NewScope() Container
-	RegisterType(v interface{})
-	RegisterValue(v interface{})
-	RegisterFactory(v interface{}, ctor Constructor, dtor Destructor)
-	Use(tag string, typeName string)
-	UseType(tag string, v interface{})
-	UseValue(tag string, v interface{})
-	UseFactory(tag string, ctor Constructor, dtor Destructor)
+	RegisterType(v interface{}, lifetime Lifetime)
+	RegisterValue(v interface{}, lifetime Lifetime)
+	RegisterFactory(v interface{}, ctor Constructor, dtor Destructor, lifetime Lifetime)
+	Use(tag string, tagOrTypeName string)
+	UseType(tag string, v interface{}, lifetime Lifetime)
+	UseValue(tag string, v interface{}, lifetime Lifetime)
+	UseFactory(tag string, ctor Constructor, dtor Destructor, lifetime Lifetime)
 	Resolve(tag string) (interface{}, error)
 	ResolveAll(tag string) ([]interface{}, error)
 	Inject(v interface{}) error
+	Close() error
 }
+
+type Lifetime int
+
+const (
+	Transient Lifetime = iota
+	Scoped
+	Singleton
+)
 
 type Constructor func(c Container) (interface{}, error)
 
@@ -34,12 +44,19 @@ type Destructor func(i interface{}) error
 
 type container struct {
 	parent    *container
+	aliases   []*alias
 	factories []*factory
 	lock      sync.RWMutex
 }
 
+type alias struct {
+	Tag     string
+	Aliased string
+}
+
 type factory struct {
 	Tag         string
+	Lifetime    Lifetime
 	Constructor Constructor
 	Destructor  Destructor
 }
@@ -47,35 +64,36 @@ type factory struct {
 func (this *container) NewScope() Container {
 	return &container{
 		this,
+		make([]*alias, 0),
 		make([]*factory, 0),
 		sync.RWMutex{},
 	}
 }
 
-func (this *container) RegisterType(v interface{}) {
+func (this *container) RegisterType(v interface{}, lifetime Lifetime) {
 	t := reflect.TypeOf(v)
-	this.UseType(t.String(), v)
+	this.UseType(t.String(), v, lifetime)
 }
 
-func (this *container) RegisterValue(v interface{}) {
+func (this *container) RegisterValue(v interface{}, lifetime Lifetime) {
 	t := reflect.TypeOf(v)
-	this.UseValue(t.String(), v)
+	this.UseValue(t.String(), v, lifetime)
 }
 
-func (this *container) RegisterFactory(v interface{}, ctor Constructor, dtor Destructor) {
+func (this *container) RegisterFactory(v interface{}, ctor Constructor, dtor Destructor, lifetime Lifetime) {
 	t := reflect.TypeOf(v)
-	this.UseFactory(t.String(), ctor, dtor)
+	this.UseFactory(t.String(), ctor, dtor, lifetime)
 }
 
-func (this *container) UseType(tag string, v interface{}) {
+func (this *container) UseType(tag string, v interface{}, lifetime Lifetime) {
 	this.lock.Lock()
 	defer this.lock.Unlock()
 
+	typ := reflect.TypeOf(v)
 	this.factories = append(this.factories, &factory{
-		Tag: tag,
+		Tag:      tag,
+		Lifetime: lifetime,
 		Constructor: func(c Container) (interface{}, error) {
-			typ := reflect.TypeOf(v)
-
 			var instanceType reflect.Type
 			if typ.Kind() == reflect.Ptr {
 				instanceType = typ.Elem()
@@ -98,12 +116,13 @@ func (this *container) UseType(tag string, v interface{}) {
 	})
 }
 
-func (this *container) UseValue(tag string, v interface{}) {
+func (this *container) UseValue(tag string, v interface{}, lifetime Lifetime) {
 	this.lock.Lock()
 	defer this.lock.Unlock()
 
 	this.factories = append(this.factories, &factory{
-		Tag: tag,
+		Tag:      tag,
+		Lifetime: lifetime,
 		Constructor: func(c Container) (interface{}, error) {
 			return v, nil
 		},
@@ -111,28 +130,66 @@ func (this *container) UseValue(tag string, v interface{}) {
 	})
 }
 
-func (this *container) UseFactory(tag string, ctor Constructor, dtor Destructor) {
+func (this *container) UseFactory(tag string, ctor Constructor, dtor Destructor, lifetime Lifetime) {
 	this.lock.Lock()
 	defer this.lock.Unlock()
 
 	this.factories = append(this.factories, &factory{
 		Tag:         tag,
+		Lifetime:    lifetime,
 		Constructor: ctor,
 		Destructor:  dtor,
 	})
 }
 
-func (this *container) Use(tag string, typeName string) {
+func (this *container) Use(tag string, tagOrTypeName string) {
 	this.lock.Lock()
 	defer this.lock.Unlock()
 
-	this.factories = append(this.factories, &factory{
-		Tag: tag,
-		Constructor: func(c Container) (interface{}, error) {
-			return this.Resolve(typeName)
-		},
-		Destructor: nil,
+	this.aliases = append(this.aliases, &alias{
+		Tag:     tag,
+		Aliased: tagOrTypeName,
 	})
+}
+
+type tags []string
+
+func (this tags) Contains(tag string) bool {
+	for _, x := range this {
+		if x == tag {
+			return true
+		}
+	}
+	return false
+}
+
+func (this *container) resolveAliases(tag string) tags {
+	tags := []string{tag}
+
+	for i := 0; i < len(tags); i++ {
+		for c := this; c != nil; c = c.parent {
+			for _, alias := range c.aliases {
+				if tags[i] != alias.Tag {
+					continue
+				}
+
+				found := false
+				for j := 0; j < len(tags); j++ {
+					if alias.Aliased == tags[j] {
+						found = true
+						break
+					}
+				}
+				if found {
+					continue
+				}
+
+				tags = append(tags, alias.Aliased)
+			}
+		}
+	}
+
+	return tags
 }
 
 func (this *container) Resolve(tag string) (interface{}, error) {
@@ -140,18 +197,21 @@ func (this *container) Resolve(tag string) (interface{}, error) {
 		this.lock.RLock()
 		defer this.lock.RUnlock()
 
-		for i := len(this.factories) - 1; 0 <= i; i-- {
-			if tag == this.factories[i].Tag {
-				return this.factories[i], true
+		tags := this.resolveAliases(tag)
+
+		for c := this; c != nil; c = c.parent {
+			for i := len(c.factories) - 1; 0 <= i; i-- {
+				if tags.Contains(c.factories[i].Tag) {
+					return c.factories[i], true
+				}
 			}
 		}
+
 		return nil, false
 	}()
 
 	if found {
 		return factory.Constructor(this)
-	} else if this.parent != nil {
-		return this.parent.Resolve(tag)
 	} else {
 		return nil, fmt.Errorf("no matching tag found.")
 	}
@@ -163,24 +223,19 @@ func (this *container) ResolveAll(tag string) ([]interface{}, error) {
 		this.lock.RLock()
 		defer this.lock.RUnlock()
 
-		for i := 0; i < len(this.factories); i++ {
-			if tag == this.factories[i].Tag {
-				factories = append(factories, this.factories[i])
+		tags := this.resolveAliases(tag)
+
+		for c := this; c != nil; c = c.parent {
+			for i := len(c.factories) - 1; 0 <= i; i-- {
+				if tags.Contains(c.factories[i].Tag) {
+					factories = append(factories, c.factories[i])
+				}
 			}
 		}
 	}()
 
 	var instances []interface{}
 	var err error
-	if this.parent != nil {
-		instances, err = this.parent.ResolveAll(tag)
-		if err != nil {
-			return nil, err
-		}
-	} else {
-		instances = make([]interface{}, 0, 10)
-	}
-
 	for _, factory := range factories {
 		i, err := factory.Constructor(this)
 		if err != nil {
@@ -192,7 +247,7 @@ func (this *container) ResolveAll(tag string) ([]interface{}, error) {
 	return instances, nil
 }
 
-func (this *container) Inject(i interface{}) error {
+func (this *container) Inject(v interface{}) error {
 	v := reflect.ValueOf(i)
 	if v.Type().Kind() == reflect.Ptr {
 		v = reflect.Indirect(v)
@@ -214,4 +269,8 @@ func (this *container) Inject(i interface{}) error {
 	}
 
 	return nil
+}
+
+func (this *container) Close() error {
+	panic("not implemented")
 }

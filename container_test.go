@@ -9,7 +9,7 @@ type MyStruct struct {
 }
 
 func TestResolveType(t *testing.T) {
-	Registry.RegisterType(&MyStruct{})
+	Registry.RegisterType(&MyStruct{}, Transient)
 
 	c := Registry.NewScope()
 	c.Use("struct", "*di.MyStruct")
@@ -24,8 +24,8 @@ type MyStruct2 struct {
 
 func TestResolveValue(t *testing.T) {
 	c := Registry.NewScope()
-	c.UseType("struct", &MyStruct2{})
-	c.UseValue("param", "hello, world!")
+	c.UseType("struct", &MyStruct2{}, Transient)
+	c.UseValue("param", "hello, world!", Transient)
 
 	v, err := c.Resolve("struct")
 	assert.NoError(t, err)
