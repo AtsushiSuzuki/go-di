@@ -98,7 +98,7 @@ type Container interface {
 	ResolveAll(tag string) ([]interface{}, error)
 
 	// `Inject` fills struct `v`'s fields with resolved instances
-	// if field with tagged as `di:"<tag>"`
+	// if field is tagged with `di:"<tag>"`
 	Inject(v interface{}) error
 
 	// `Close` invokes destructors for all instances resolved by
@@ -278,11 +278,13 @@ func (this *container) createInstance(f *factory) (interface{}, error) {
 
 	switch f.Lifetime {
 	case Scoped:
-		this.lock.RLock()
-		cached, ok := this.cache[f]
-		this.lock.RUnlock()
-		if ok {
-			return cached, nil
+		for c := this; c != nil; c = c.parent {
+			c.lock.RLock()
+			cached, ok := c.cache[f]
+			c.lock.RUnlock()
+			if ok {
+				return cached, nil
+			}
 		}
 	case Singleton:
 		root.lock.RLock()
